@@ -1,8 +1,82 @@
 import joblib
 import pandas as pd
 import numpy as np
+import datetime
 
-model=joblib.load("./model/lgbm.joblib")
+# Stage 1: Safety Classifier - Determines if location is SAFE or has CRIME risk
+try:
+    safety_model = joblib.load("./model/best_lgbm.joblib")
+    STAGE1_AVAILABLE = True
+    print("✓ Stage 1 model (best_lgbm.joblib) loaded successfully")
+except FileNotFoundError:
+    print("WARNING: best_lgbm.joblib not found. Using fallback mode (Stage 2 only).")
+    STAGE1_AVAILABLE = False
+    safety_model = None
+except (AttributeError, ModuleNotFoundError, ImportError) as e:
+    print(f"WARNING: Could not load best_lgbm.joblib due to version mismatch: {e}")
+    print("This is likely a scikit-learn version incompatibility.")
+    print("Using fallback mode (Stage 2 only).")
+    STAGE1_AVAILABLE = False
+    safety_model = None
+
+# Stage 2: Crime Type Classifier - Determines type of crime if Stage 1 predicts CRIME
+crime_type_model = joblib.load("./model/lgbm.joblib")
+
+def map_age_to_group(age):
+    """Map age to age group string"""
+    if age < 18:
+        return "<18"
+    elif 18 <= age < 25:
+        return "18-24"
+    elif 25 <= age < 45:
+        return "25-44"
+    elif 45 <= age < 65:
+        return "45-64"
+    else:
+        return "65+"
+
+def map_gender(gender):
+    """Map gender string to M/F/U format"""
+    if gender.lower() in ["male", "m"]:
+        return "M"
+    elif gender.lower() in ["female", "f"]:
+        return "F"
+    else:
+        return "U"
+
+def create_stage1_df(date, hour, borough, age, gender):
+    """
+    Create DataFrame for Stage 1 Safety Classifier
+    Features: BORO_NM, hour, weekday, month, is_weekend, is_night, 
+              VIC_SEX, VIC_AGE_GROUP, SUSP_SEX, SUSP_AGE_GROUP
+    """
+    hour = int(hour) if int(hour) < 24 else 0
+    weekday = date.weekday()  # 0=Monday, 6=Sunday
+    month = date.month
+    is_weekend = 1 if weekday >= 5 else 0
+    is_night = 1 if (hour >= 20 or hour <= 6) else 0
+    
+    # Map inputs to expected format
+    vic_sex = map_gender(gender)
+    vic_age_group = map_age_to_group(int(age))
+    boro_nm = borough.upper()
+    
+    # Create dataframe with exact features expected by Stage 1 model
+    df = pd.DataFrame([{
+        "BORO_NM": boro_nm,
+        "hour": hour,
+        "weekday": weekday,
+        "month": month,
+        "is_weekend": is_weekend,
+        "is_night": is_night,
+        "VIC_SEX": vic_sex,
+        "VIC_AGE_GROUP": vic_age_group,
+        "SUSP_SEX": "U",  # Always unknown for predictions
+        "SUSP_AGE_GROUP": "UNKNOWN"  # Always unknown for predictions
+    }])
+    
+    return df
+
 
     
 def create_df(date, hour, latitude, longitude, place, age, race, gender, precinct, borough):
@@ -42,9 +116,13 @@ def create_df(date, hour, latitude, longitude, place, age, race, gender, precinc
     return df.values
 
 def predict(data):
+   """
+   Legacy function for Stage 2 crime type prediction only.
+   Used when Stage 1 model is not available or for backward compatibility.
+   """
    # Get prediction and probability scores
-   pred = model.predict(data)[0]
-   proba = model.predict_proba(data)[0]  # Returns probabilities for each class
+   pred = crime_type_model.predict(data)[0]
+   proba = crime_type_model.predict_proba(data)[0]  # Returns probabilities for each class
    
    # Get confidence (probability of predicted class)
    confidence = proba[pred] * 100
@@ -97,3 +175,90 @@ def predict(data):
            'SEXUAL': round(proba[3] * 100, 2) if len(proba) > 3 else 0
        }
    }
+
+
+def predict_two_stage(date, hour, latitude, longitude, place, age, race, gender, precinct, borough):
+    """
+    Two-Stage Crime Prediction System
+    
+    Stage 1: Safety Classifier - Determines if location is SAFE or has CRIME risk
+    Stage 2: Crime Type Classifier - If crime risk detected, classify the type
+    
+    Returns:
+        dict: Prediction results including safety status, risk level, crime type (if applicable)
+    """
+    
+    # Stage 1: Safety Classification
+    if STAGE1_AVAILABLE:
+        # Prepare data for Stage 1 model
+        stage1_data = create_stage1_df(date, hour, borough, age, gender)
+        
+        # Get safety prediction
+        safety_proba_array = safety_model.predict_proba(stage1_data)[0]
+        safety_prediction = safety_model.predict(stage1_data)[0]
+        
+        # Debug: Print what the model is predicting
+        print(f"DEBUG - Stage 1 Prediction: {safety_prediction}")
+        print(f"DEBUG - Stage 1 Probabilities: Class 0={safety_proba_array[0]:.3f}, Class 1={safety_proba_array[1]:.3f}")
+        
+        # IMPORTANT: Class labels appear to be INVERTED in this model
+        # Based on testing: Class 0 = CRIME, Class 1 = SAFE (opposite of expected)
+        # So we use Class 0 probability as crime probability
+        crime_probability = safety_proba_array[0] * 100  # Class 0 = CRIME probability
+        
+        print(f"DEBUG - Crime Probability (CORRECTED): {crime_probability:.1f}%")
+        
+        # Crime threshold (adjustable)
+        CRIME_THRESHOLD = 0.5
+        
+        # If crime probability (Class 0) is LOW, location is SAFE
+        if safety_proba_array[0] < CRIME_THRESHOLD:
+            return {
+                'status': 'SAFE',
+                'risk_level': 'LOW',
+                'crime_probability': round(crime_probability, 2),
+                'confidence': round((1 - safety_proba_array[0]) * 100, 2),  # Confidence in SAFE prediction
+                'message': f'This area appears safe. Crime risk: {crime_probability:.1f}%',
+                'crime_type': None,
+                'crime_list': [],
+                'probabilities': {
+                    'DRUGS/ALCOHOL': 0,
+                    'PERSONAL': 0,
+                    'PROPERTY': 0,
+                    'SEXUAL': 0
+                }
+            }
+    else:
+        # Fallback: If Stage 1 model not available, assume crime risk and go to Stage 2
+        safety_proba_array = [0.6, 0.4]  # Default moderate risk (Class 0 = CRIME)
+        crime_probability = 60
+    
+    # Stage 2: Crime Type Classification (only if crime risk detected)
+    # Prepare data for Stage 2 model (legacy format)
+    stage2_data = create_df(date, hour, latitude, longitude, place, age, race, gender, precinct, borough)
+    
+    # Get crime type prediction
+    stage2_result = predict(stage2_data)
+    
+    # Combine Stage 1 and Stage 2 results
+    # Determine overall risk level (using Class 0 = CRIME probability)
+    if STAGE1_AVAILABLE:
+        if safety_proba_array[0] >= 0.7:
+            overall_risk = "HIGH"
+        elif safety_proba_array[0] >= 0.5:
+            overall_risk = "MEDIUM"
+        else:
+            overall_risk = "LOW"
+    else:
+        overall_risk = stage2_result['risk_level']
+    
+    return {
+        'status': 'CRIME RISK',
+        'risk_level': overall_risk,
+        'crime_probability': round(crime_probability, 2) if STAGE1_AVAILABLE else None,
+        'confidence': stage2_result['confidence'],
+        'crime_type': stage2_result['crime_type'],
+        'crime_list': stage2_result['crime_list'],
+        'probabilities': stage2_result['probabilities'],
+        'message': f'Crime risk detected: {crime_probability:.1f}%. Most likely: {stage2_result["crime_type"]}' if STAGE1_AVAILABLE else f'Crime type predicted: {stage2_result["crime_type"]}'
+    }

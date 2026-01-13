@@ -6,7 +6,7 @@ from datetime import datetime
 import service as service
 import geopandas as gpd
 from shapely.geometry import Point
-from pyproj import Proj, transform
+from pyproj import Transformer
 import requests
 
 def get_coordinates(destination):
@@ -36,9 +36,9 @@ def get_pos(lat, lng):
     return lat, lng
 
 def lon_lat_to_utm(lon, lat):
-    utm_proj = Proj("epsg:2263")
-    wgs84 = Proj("epsg:4326")
-    utm_x, utm_y = transform(wgs84, utm_proj, lon, lat, always_xy=True)
+    # Use Transformer instead of deprecated transform function
+    transformer = Transformer.from_crs("epsg:4326", "epsg:2263", always_xy=True)
+    utm_x, utm_y = transformer.transform(lon, lat)
     return utm_x, utm_y
 
 shapefile = './shapes/geo_export_84578745-538d-401a-9cb5-34022c705879.shp'
@@ -663,13 +663,15 @@ if map and map.get('last_clicked'):
                 st.error("❌ Please select a time for your visit")
             else:
                 with st.spinner('AI is analyzing crime patterns...'):
-                    # Call service to create a DataFrame and predict
-                    X = service.create_df(date, hour, lat, lon, place, age, race, gender, precinct, borough)
-                    result = service.predict(X)
+                    # Call TWO-STAGE prediction system
+                    result = service.predict_two_stage(
+                        date, hour, lat, lon, place, age, race, gender, precinct, borough
+                    )
                     
                     # Extract prediction data
-                    crime_type = result['crime_type']
-                    crime_list = result['crime_list']
+                    status = result['status']  # 'SAFE' or 'CRIME RISK'
+                    crime_type = result.get('crime_type')
+                    crime_list = result.get('crime_list', [])
                     confidence = result['confidence']
                     risk_level = result['risk_level']
                     probabilities = result['probabilities']
@@ -691,20 +693,50 @@ if map and map.get('last_clicked'):
                         'SEXUAL': '🚫'
                     }
                     
-                    # Display based on risk level
-                    if risk_level == 'LOW':
-                        # Safe area display
+                    # Display based on status (SAFE or CRIME RISK)
+                    if status == 'SAFE':
+                        # SAFE area display (Stage 1 determined it's safe)
+                        risk_gradient = 'linear-gradient(135deg, #10b981 0%, #059669 100%)'
                         st.markdown(f"""
                         <div style="background: {risk_gradient}; padding: 2rem; border-radius: 20px; 
                                     margin: 2rem 0; box-shadow: 0 10px 30px rgba(0,0,0,0.4); 
                                     border: 3px solid #34d399; color: white;">
                             <h2 style="text-align: center; margin-bottom: 1rem;">
-                                {risk_emoji} SAFETY ASSESSMENT: {risk_text}
+                                SAFETY ASSESSMENT: SAFE AREA
+                            </h2>
+                            <div style="background: rgba(255,255,255,0.2); padding: 1.5rem; 
+                                        border-radius: 15px; text-align: center; margin: 1rem 0;">
+                                <h3 style="margin: 0;">This location appears SAFE</h3>
+                                <p style="font-size: 1.1rem; margin-top: 0.5rem;">
+                                    Crime Risk Probability: {result.get('crime_probability', 0)}%<br>
+                                    Safety Confidence: {confidence}%
+                                </p>
+                            </div>
+                            <div style="background: rgba(255,255,255,0.2); padding: 1rem; 
+                                        border-radius: 10px; margin-top: 1rem;">
+                                <strong>General Safety Tips:</strong><br>
+                                • Stay aware of your surroundings<br>
+                                • Keep emergency contacts handy<br>
+                                • Report any suspicious activity to authorities<br>
+                                • Enjoy your visit responsibly
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    elif risk_level == 'LOW' and status == 'CRIME RISK':
+                        # Low crime risk display (Stage 2 shows low probability crimes)
+                        risk_gradient = 'linear-gradient(135deg, #10b981 0%, #059669 100%)'
+                        st.markdown(f"""
+                        <div style="background: {risk_gradient}; padding: 2rem; border-radius: 20px; 
+                                    margin: 2rem 0; box-shadow: 0 10px 30px rgba(0,0,0,0.4); 
+                                    border: 3px solid #34d399; color: white;">
+                            <h2 style="text-align: center; margin-bottom: 1rem;">
+                                SAFETY ASSESSMENT: LOW RISK
                             </h2>
                             <div style="background: rgba(255,255,255,0.2); padding: 1.5rem; 
                                         border-radius: 15px; text-align: center; margin: 1rem 0;">
                                 <h3 style="margin: 0;">This location shows LOW crime risk</h3>
                                 <p style="font-size: 1.1rem; margin-top: 0.5rem;">
+                                    Most Likely Crime Type (if any): {crime_type}<br>
                                     Model Confidence: {confidence}%
                                 </p>
                             </div>
@@ -719,22 +751,43 @@ if map and map.get('last_clicked'):
                         </div>
                         """, unsafe_allow_html=True)
                     else:
-                        # Medium/High risk display
+                        # Medium/High risk display (CRIME RISK detected)
+                        risk_gradient = 'linear-gradient(135deg, #f59e0b 0%, #d97706 100%)' if risk_level == 'MEDIUM' else 'linear-gradient(135deg, #ef4444 0%, #dc2626 100%)'
+                        risk_text = 'MODERATE RISK' if risk_level == 'MEDIUM' else 'HIGH RISK'
+                        
+                        crime_emoji = {
+                            'DRUGS/ALCOHOL': '',
+                            'PROPERTY': '',
+                            'PERSONAL': '',
+                            'SEXUAL': ''
+                        }
+                        
                         html_content = f"""
                         <div style="background: {risk_gradient}; padding: 2rem; border-radius: 20px; 
                                     margin: 2rem 0; box-shadow: 0 10px 30px rgba(0,0,0,0.4); 
                                     border: 3px solid {'#fbbf24' if risk_level == 'MEDIUM' else '#fca5a5'}; 
                                     animation: pulse 2s infinite; color: white;">
                             <h2 style="text-align: center; margin-bottom: 1rem;">
-                                {risk_emoji} SAFETY ASSESSMENT: {risk_text}
+                                SAFETY ASSESSMENT: {risk_text}
                             </h2>
                             <div style="background: rgba(255,255,255,0.25); padding: 1.5rem; 
                                         border-radius: 15px; text-align: center; margin: 1rem 0; 
                                         border: 2px solid rgba(255,255,255,0.4);">
                                 <h3 style="margin: 0;">Most Likely Crime Type: {crime_emoji.get(crime_type, '')} {crime_type}</h3>
-                                <p style="font-size: 1.1rem; margin-top: 0.5rem;">
+                                <p style="font-size: 1.1rem; margin-top: 0.5rem;">"""
+                        
+                        # Add crime probability if available (from Stage 1)
+                        if result.get('crime_probability'):
+                            html_content += f"""
+                                    Crime Risk: {result['crime_probability']}%<br>
+                                    Type Confidence: {confidence}% | Risk Level: {risk_level}
+                                </p>"""
+                        else:
+                            html_content += f"""
                                     Confidence: {confidence}% | Risk Level: {risk_level}
-                                </p>
+                                </p>"""
+                        
+                        html_content += f"""
                             </div>
                             
                             <h3 style="color: white; margin-top: 1.5rem;">Crime Probability Breakdown:</h3>
@@ -799,9 +852,11 @@ if map and map.get('last_clicked'):
                         """
                         components.html(html_content, height=800)
                     
-                    # Status message based on risk
-                    if risk_level == 'LOW':
-                        st.success("This area appears relatively safe based on historical data!")
+                    # Status message based on status and risk level
+                    if status == 'SAFE':
+                        st.success("This area appears safe based on AI analysis of historical crime patterns!")
+                    elif risk_level == 'LOW':
+                        st.info("Low crime risk detected. Exercise normal precautions.")
                     elif risk_level == 'MEDIUM':
                         st.warning("Exercise caution in this area. Stay vigilant!")
                     else:
