@@ -1,0 +1,17 @@
+streamlit
+folium
+streamlit-folium
+seaborn
+pandas
+numpy
+requests
+joblib
+scikit-learn
+scikit-plot
+xgboost
+catboost
+lightgbm
+geopy
+geopandas
+shapely
+pyproj
